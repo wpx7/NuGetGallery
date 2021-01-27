@@ -34,7 +34,11 @@ namespace NuGetGallery.Infrastructure
             _tableRef = tableClient.GetTableReference(tableName);
 
             // Create the actual Azure Table, if it doesn't yet exist.
-            bool newTable = _tableRef.CreateIfNotExists();
+            //bool newTable = false;
+            //if (!_tableRef.Exists())
+            //{
+                var newTable = _tableRef.CreateIfNotExists();
+            //}
 
             // Create the Index if it doesn't yet exist.
             bool needsIndex = newTable;

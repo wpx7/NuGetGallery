@@ -5,13 +5,15 @@ using Autofac;
 using CsvHelper;
 using CsvHelper.Configuration;
 using CsvHelper.TypeConversion;
+using Knapcode.MiniZip;
 using Microsoft.Extensions.CommandLineUtils;
 using NuGet.Packaging;
 using NuGet.Services.Entities;
 using NuGetGallery;
-using NuGetGallery.Configuration;
 using System;
+using System.Collections.Generic;
 using System.Data.Entity;
+using System.Data.SqlClient;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -20,6 +22,7 @@ using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
 using GalleryTools.Utils;
+using NuGet.Services.Sql;
 
 namespace GalleryTools.Commands
 {
@@ -34,6 +37,15 @@ namespace GalleryTools.Commands
         protected virtual int CollectBatchSize => 10;
 
         protected virtual int UpdateBatchSize => 100;
+
+        protected virtual int LimitTo => 0;
+
+        protected virtual MetadataSourceType SourceType => MetadataSourceType.Nuspec;
+
+        protected virtual string QueryIncludes => null;
+
+        private IContainer _serviceContainer;
+        private IPackageFileService _packageFileService;
 
         public static void Configure<TCommand>(CommandLineApplication config) where TCommand : BackfillCommand<TMetadata>, new()
         {
@@ -53,10 +65,13 @@ namespace GalleryTools.Commands
                 builder.RegisterAssemblyModules(typeof(DefaultDependenciesModule).Assembly);
                 var container = builder.Build();
 
-                var connectionString = container.Resolve<IAppConfiguration>().SqlConnectionString;
+                var sqlConnectionFactory = container.Resolve<ISqlConnectionFactory>();
+                var sqlConnection = await sqlConnectionFactory.CreateAsync();
                 var serviceDiscoveryUriValue = new Uri(serviceDiscoveryUri.Value());
 
                 var command = new TCommand();
+                command._serviceContainer = container;
+                command._packageFileService = container.Resolve<IPackageFileService>();
 
                 var metadataFileName = fileName.HasValue() ? fileName.Value() : command.MetadataFileName;
                 
@@ -75,24 +90,26 @@ namespace GalleryTools.Commands
                         }
                     }
 
-                    await command.Collect(connectionString, serviceDiscoveryUriValue, lastCreateTime, metadataFileName);
+                    await command.Collect(sqlConnection, serviceDiscoveryUriValue, lastCreateTime, metadataFileName);
                 }
 
                 if (updateDB.HasValue())
                 {
-                    await command.Update(connectionString, metadataFileName);
+                    await command.Update(sqlConnection, metadataFileName);
                 }
 
                 return 0;
             });
         }
 
-        public async Task Collect(string connectionString, Uri serviceDiscoveryUri, DateTime? lastCreateTime, string fileName)
+        public async Task Collect(SqlConnection connection, Uri serviceDiscoveryUri, DateTime? lastCreateTime, string fileName)
         {
-            using (var context = new EntitiesContext(connectionString, readOnly: true))
+            using (var context = new EntitiesContext(connection, readOnly: true))
             using (var cursor = new FileCursor(CursorFileName))
             using (var logger = new Logger(ErrorsFileName))
             {
+                context.SetCommandTimeout(300); // large query
+
                 var startTime = await cursor.Read();
 
                 logger.Log($"Starting metadata collection - Cursor time: {startTime:u}");
@@ -100,10 +117,19 @@ namespace GalleryTools.Commands
                 var repository = new EntityRepository<Package>(context);
 
                 var packages = repository.GetAll()
-                    .Include(p => p.PackageRegistration)
+                    .Include(p => p.PackageRegistration);
+                if (QueryIncludes != null)
+                {
+                    packages = packages.Include(QueryIncludes);
+                }
+                
+                packages = packages
                     .Where(p => p.Created < lastCreateTime && p.Created > startTime)
-                    .Where(p => p.PackageStatusKey == PackageStatus.Available || p.PackageStatusKey == PackageStatus.Validating)
-                    .OrderBy(p => p.Created);
+                    .OrderBy(p => p.PackageRegistration.Id);
+                if (LimitTo > 0)
+                {
+                    packages = packages.Take(LimitTo);
+                }
 
                 var flatContainerUri = await GetFlatContainerUri(serviceDiscoveryUri);
 
@@ -118,11 +144,20 @@ namespace GalleryTools.Commands
                         var id = package.PackageRegistration.Id;
                         var version = package.NormalizedVersion;
 
-                        var nuspecUri = $"{flatContainerUri}/{id.ToLowerInvariant()}/{version.ToLowerInvariant()}/{id.ToLowerInvariant()}.nuspec";
-
                         try
                         {
-                            var metadata = await FetchMetadata(http, nuspecUri);
+                            var metadata = default(TMetadata);
+
+                            if (SourceType == MetadataSourceType.Nuspec)
+                            {
+                                var nuspecUri =
+                                    $"{flatContainerUri}/{id.ToLowerInvariant()}/{version.ToLowerInvariant()}/{id.ToLowerInvariant()}.nuspec";
+                                metadata = await FetchMetadataAsync(http, nuspecUri);
+                            }
+                            else if (SourceType == MetadataSourceType.Entities)
+                            {
+                                metadata = await FetchMetadataAsync(http, $"{flatContainerUri}/{id.ToLowerInvariant()}/{version.ToLowerInvariant()}/{id.ToLowerInvariant()}.nupkg", package);
+                            }
 
                             if (ShouldWriteMetadata(metadata))
                             {
@@ -163,14 +198,14 @@ namespace GalleryTools.Commands
             }
         }
 
-        public async Task Update(string connectionString, string fileName)
+        public async Task Update(SqlConnection connection, string fileName)
         {
             if (!File.Exists(fileName))
             {
                 throw new ArgumentException($"File '{fileName}' doesn't exist");
             }
 
-            using (var context = new EntitiesContext(connectionString, readOnly: false))
+            using (var context = new EntitiesContext(connection, readOnly: false))
             using (var cursor = new FileCursor(CursorFileName))
             using (var logger = new Logger(ErrorsFileName))
             {
@@ -199,7 +234,6 @@ namespace GalleryTools.Commands
 
                             if (package != null)
                             {
-
                                 UpdatePackage(package, metadata.Metadata);
 
                                 logger.LogPackage(metadata.Id, metadata.Version, "Metadata updated.");
@@ -234,7 +268,9 @@ namespace GalleryTools.Commands
             }
         }
 
-        protected abstract TMetadata ReadMetadata(NuspecReader reader);
+        protected virtual TMetadata ReadMetadata(NuspecReader reader) => default;
+
+        protected virtual TMetadata ReadMetadata(IList<string> files, Package package) => default;
 
         protected abstract bool ShouldWriteMetadata(TMetadata metadata);
 
@@ -251,7 +287,7 @@ namespace GalleryTools.Commands
             return result.First().AbsoluteUri.TrimEnd('/');
         }
 
-        private async Task<TMetadata> FetchMetadata(HttpClient httpClient, string nuspecUri)
+        private async Task<TMetadata> FetchMetadataAsync(HttpClient httpClient, string nuspecUri)
         {
             using (var nuspecStream = await httpClient.GetStreamAsync(nuspecUri))
             {
@@ -261,6 +297,46 @@ namespace GalleryTools.Commands
 
                 return ReadMetadata(reader);
             }
+        }
+
+        private async Task<TMetadata> FetchMetadataAsync(HttpClient httpClient, string flatContainerUri, Package package)
+        {
+            var httpZipProvider = new HttpZipProvider(httpClient);
+            httpZipProvider.RequireAcceptRanges = false;
+            httpZipProvider.RequireContentRange = false;
+
+            try
+            {
+                var zipDirectoryReader = await httpZipProvider.GetReaderAsync(new Uri(flatContainerUri));
+                var zipDirectory = await zipDirectoryReader.ReadAsync();
+                var files = zipDirectory
+                    .Entries
+                    .Select(x => x.GetName())
+                    .ToList();
+
+                return ReadMetadata(files, package);
+            }
+            catch (MiniZipHttpStatusCodeException ex)
+            {
+                return ReadMetadata(null, package);
+            }
+
+
+/*
+            using (var packageStream = await _packageFileService.DownloadPackageFileAsync(package))
+            {
+                if (packageStream == null)
+                {
+                    return ReadMetadata(null, package);
+                }
+                else
+                {
+                    using (var packageArchive = new PackageArchiveReader(packageStream, leaveStreamOpen: false))
+                    {
+                        return ReadMetadata(packageArchive, package);
+                    }
+                }
+            }*/
         }
 
         private static XDocument LoadDocument(Stream stream)
@@ -459,6 +535,12 @@ namespace GalleryTools.Commands
             {
                 Writer.Dispose();
             }
+        }
+
+        public enum MetadataSourceType
+        {
+            Nuspec,
+            Entities
         }
     }
 }
