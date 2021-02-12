@@ -65,7 +65,7 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="NuGet.Services.Validation">
-      <Version>2.84.0-nikhgup-serviceBusUpdate-4462793</Version>
+      <Version>2.85.0-nikhgup-serviceBusUpdate-4466927</Version>
     </PackageReference>
   </ItemGroup>
   <ItemGroup>

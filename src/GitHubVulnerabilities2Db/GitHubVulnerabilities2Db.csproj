@@ -89,7 +89,7 @@
       <Version>4.3.0-dev-3612825</Version>
     </PackageReference>
     <PackageReference Include="NuGet.Services.Cursor">
-      <Version>2.84.0-nikhgup-serviceBusUpdate-4462793</Version>
+      <Version>2.85.0-nikhgup-serviceBusUpdate-4466927</Version>
     </PackageReference>
   </ItemGroup>
   <ItemGroup>
